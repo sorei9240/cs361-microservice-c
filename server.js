@@ -3,24 +3,28 @@ const cors = require('cors');
 const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:5173', 'http://127.0.0.1:3000', 'http://127.0.0.1:5173'],
+  credentials: true
+}));
 app.use(express.json());
 
 // In-memory cache for audio URLs and metadata
 let audioCache = new Map();
 let preloadQueue = new Map();
-let requestMetrics = new Map(); 
+let requestMetrics = new Map();
 
 // Audio service configuration
 const AUDIO_CONFIG = {
   TTS_BASE_URL: 'https://translate.google.com/translate_tts',
   MAX_CACHE_SIZE: 1000,
-  PRELOAD_TIMEOUT: 5000, // 5 seconds
+  PRELOAD_TIMEOUT: 5000,
   SUPPORTED_LANGUAGES: ['zh-CN', 'zh-TW'],
   DEFAULT_LANGUAGE: 'zh-CN'
 };
@@ -45,7 +49,6 @@ function generateCacheKey(text, language) {
 // Clean old cache entries when cache is full
 function cleanCache() {
   if (audioCache.size >= AUDIO_CONFIG.MAX_CACHE_SIZE) {
-    // Remove oldest 20% of entries
     const entriesToRemove = Math.floor(AUDIO_CONFIG.MAX_CACHE_SIZE * 0.2);
     const entries = Array.from(audioCache.entries());
     
@@ -61,9 +64,8 @@ function cleanCache() {
 function isValidChineseText(text) {
   if (!text || typeof text !== 'string') return false;
   
-  // Check if text contains Chinese characters
   const chineseRegex = /[\u4e00-\u9fff\u3400-\u4dbf]/;
-  return chineseRegex.test(text) && text.length <= 100; // Reasonable length limit
+  return chineseRegex.test(text) && text.length <= 100;
 }
 
 // Record response time metrics
@@ -75,19 +77,15 @@ function recordMetrics(endpoint, responseTime) {
   const metrics = requestMetrics.get(endpoint);
   metrics.push(responseTime);
   
-  // Keep only last 100 measurements
   if (metrics.length > 100) {
     metrics.shift();
   }
 }
 
-// Routes
-
-// Health check with uptime monitoring
+// Health check
 app.get('/health', (req, res) => {
   const startTime = Date.now();
   
-  // Calculate average response times
   const avgResponseTimes = {};
   for (const [endpoint, times] of requestMetrics) {
     if (times.length > 0) {
@@ -113,14 +111,13 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Get pronunciation audio URL (User Story 1: Pronunciation Examples)
+// Get pronunciation audio URL
 app.post('/audio', (req, res) => {
   const startTime = Date.now();
   
   try {
     const { text, language = AUDIO_CONFIG.DEFAULT_LANGUAGE } = req.body;
     
-    // Validation
     if (!isValidChineseText(text)) {
       return res.status(400).json({
         error: 'Invalid Chinese text provided',
@@ -135,7 +132,6 @@ app.post('/audio', (req, res) => {
       });
     }
     
-    // Check cache first
     const cacheKey = generateCacheKey(text, language);
     
     if (audioCache.has(cacheKey)) {
@@ -148,17 +144,15 @@ app.post('/audio', (req, res) => {
         success: true,
         text,
         language,
-        audioUrl: cachedData.audioUrl,
+        audioUrl: `/play/${cacheKey}`,
         cached: true,
         responseTime: `${responseTime}ms`
       });
     }
     
-    // Generate new audio URL
     const audioUrl = generateAudioUrl(text, language);
     
-    // Cache the result
-    cleanCache(); // Clean cache if needed
+    cleanCache();
     audioCache.set(cacheKey, {
       audioUrl,
       text,
@@ -173,7 +167,7 @@ app.post('/audio', (req, res) => {
       success: true,
       text,
       language,
-      audioUrl,
+      audioUrl: `/play/${cacheKey}`,
       cached: false,
       responseTime: `${responseTime}ms`
     });
@@ -189,6 +183,46 @@ app.post('/audio', (req, res) => {
   }
 });
 
+// Proxy endpoint to serve audio files (fixes CORS issues)
+app.get('/play/:cacheKey', (req, res) => {
+  const { cacheKey } = req.params;
+  
+  if (!audioCache.has(cacheKey)) {
+    return res.status(404).json({
+      error: 'Audio not found',
+      details: 'The requested audio has not been cached or has expired'
+    });
+  }
+  
+  const cachedData = audioCache.get(cacheKey);
+  const audioUrl = cachedData.audioUrl;
+  
+  console.log(`Proxying audio for ${cachedData.text}: ${audioUrl}`);
+  
+  const request = https.get(audioUrl, (audioResponse) => {
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    audioResponse.pipe(res);
+  });
+  
+  request.on('error', (error) => {
+    console.error('Error proxying audio:', error);
+    res.status(500).json({
+      error: 'Failed to retrieve audio',
+      details: error.message
+    });
+  });
+  
+  request.setTimeout(10000, () => {
+    request.destroy();
+    res.status(504).json({
+      error: 'Audio request timed out'
+    });
+  });
+});
+
 // Preload audio for next card 
 app.post('/preload', (req, res) => {
   const startTime = Date.now();
@@ -196,7 +230,6 @@ app.post('/preload', (req, res) => {
   try {
     const { texts, language = AUDIO_CONFIG.DEFAULT_LANGUAGE } = req.body;
     
-    // Validation
     if (!Array.isArray(texts) || texts.length === 0) {
       return res.status(400).json({
         error: 'Invalid input: texts must be a non-empty array'
@@ -209,7 +242,6 @@ app.post('/preload', (req, res) => {
       });
     }
     
-    // Validate all texts
     for (const text of texts) {
       if (!isValidChineseText(text)) {
         return res.status(400).json({
@@ -226,7 +258,6 @@ app.post('/preload', (req, res) => {
       });
     }
     
-    // Generate preload ID for tracking
     const preloadId = crypto.randomUUID();
     const preloadData = {
       id: preloadId,
@@ -240,7 +271,6 @@ app.post('/preload', (req, res) => {
     
     preloadQueue.set(preloadId, preloadData);
     
-    // Process preloading asynchronously
     setImmediate(async () => {
       try {
         const results = [];
@@ -252,19 +282,20 @@ app.post('/preload', (req, res) => {
           let cached = false;
           
           if (audioCache.has(cacheKey)) {
-            audioUrl = audioCache.get(cacheKey).audioUrl;
+            audioUrl = `/play/${cacheKey}`;
             cached = true;
           } else {
-            audioUrl = generateAudioUrl(text, language);
+            const externalUrl = generateAudioUrl(text, language);
             
-            // Cache the result
             cleanCache();
             audioCache.set(cacheKey, {
-              audioUrl,
+              audioUrl: externalUrl,
               text,
               language,
               timestamp: new Date().toISOString()
             });
+            
+            audioUrl = `/play/${cacheKey}`;
           }
           
           results.push({
@@ -274,7 +305,6 @@ app.post('/preload', (req, res) => {
           });
         }
         
-        // Update preload status
         preloadData.status = 'completed';
         preloadData.results = results;
         preloadData.completedTime = Date.now();
@@ -328,10 +358,9 @@ app.get('/preload/:preloadId', (req, res) => {
     const preloadData = preloadQueue.get(preloadId);
     const responseTime = Date.now() - startTime;
     
-    // Clean up completed requests older than 5 minutes
     if (preloadData.status === 'completed' || preloadData.status === 'failed') {
       const age = Date.now() - preloadData.startTime;
-      if (age > 300000) { // 5 minutes
+      if (age > 300000) {
         preloadQueue.delete(preloadId);
       }
     }
@@ -401,7 +430,7 @@ app.get('/cache/stats', (req, res) => {
   }
 });
 
-// Clear cache 
+// Clear cache (admin endpoint)
 app.post('/cache/clear', (req, res) => {
   const startTime = Date.now();
   
@@ -446,6 +475,7 @@ app.use('*', (req, res) => {
     availableEndpoints: [
       'GET /health',
       'POST /audio',
+      'GET /play/:cacheKey',
       'POST /preload',
       'GET /preload/:preloadId',
       'GET /cache/stats',
@@ -457,20 +487,21 @@ app.use('*', (req, res) => {
 // Cleanup old preload requests periodically
 setInterval(() => {
   const now = Date.now();
-  const cutoff = 300000; // 5 minutes
+  const cutoff = 300000;
   
   for (const [id, data] of preloadQueue) {
     if (now - data.startTime > cutoff) {
       preloadQueue.delete(id);
     }
   }
-}, 60000); // Run every minute
+}, 60000);
 
 // Start server
 app.listen(PORT, () => {
   console.log(`Pronunciation Audio Service running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`Audio endpoint: http://localhost:${PORT}/audio`);
+  console.log(`Audio proxy: http://localhost:${PORT}/play/:cacheKey`);
   console.log(`Preload endpoint: http://localhost:${PORT}/preload`);
 });
 
