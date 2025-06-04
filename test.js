@@ -86,32 +86,33 @@ async function runTests() {
     failed++;
   }
   
-  // Test 3: Test caching (should be faster on second request)
+  // Test 3: Test caching (should be cached on second request)
   console.log('\nTest 3: Audio Caching');
   try {
-    const startTime1 = Date.now();
-    const response1 = await makeRequest('POST', '/audio', {
-      text: '世界',
-      language: 'zh-CN'
-    });
-    const time1 = Date.now() - startTime1;
+    // Use a unique text for each test run to ensure we're testing fresh caching
+    const uniqueText = `测试${Date.now()}`;
     
-    const startTime2 = Date.now();
-    const response2 = await makeRequest('POST', '/audio', {
-      text: '世界',
+    const response1 = await makeRequest('POST', '/audio', {
+      text: uniqueText,
       language: 'zh-CN'
     });
-    const time2 = Date.now() - startTime2;
+    
+    const response2 = await makeRequest('POST', '/audio', {
+      text: uniqueText,
+      language: 'zh-CN'
+    });
     
     if (response1.status === 200 && response2.status === 200 && 
-        response2.data.cached === true && time2 < time1) {
+        response1.data.cached === false && response2.data.cached === true) {
       console.log('✅ PASS - Caching works correctly');
-      console.log(`   First request: ${time1}ms, Second request: ${time2}ms`);
+      console.log(`   First request: cached = ${response1.data.cached}`);
+      console.log(`   Second request: cached = ${response2.data.cached}`);
       passed++;
     } else {
       console.log('❌ FAIL - Caching not working as expected');
-      console.log(`   First: ${time1}ms (cached: ${response1.data.cached})`);
-      console.log(`   Second: ${time2}ms (cached: ${response2.data.cached})`);
+      console.log(`   First: cached = ${response1.data.cached}`);
+      console.log(`   Second: cached = ${response2.data.cached}`);
+      console.log(`   Test text: ${uniqueText}`);
       failed++;
     }
   } catch (error) {
